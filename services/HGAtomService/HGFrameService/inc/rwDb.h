@@ -759,6 +759,35 @@ namespace HGMACHINE{
             static void writeAuditTrailLog(const std::string &logContent);
             static int readAuditTrailLogCount(const std::string &tableName="");
             static void deleteAuditTrail();
+            
+            // 高性能日志查询接口（支持SQL条件过滤和分页）
+            struct AuditLogQueryParam {
+                std::string timeFrom;      // 开始时间（格式：YYYY-MM-DD HH:MM:SS）
+                std::string timeTo;        // 结束时间
+                std::string keyword;       // 关键词（匹配Time/Operator/LogContent）
+                int pageSize;              // 每页条数
+                int pageIndex;             // 页码（从0开始）
+                AuditLogQueryParam() : pageSize(100), pageIndex(0) {}
+            };
+            
+            // 单表条件查询（带分页）
+            static std::vector<std::map<std::string,std::string>> readAuditTrailLogWithFilter(
+                const std::string &tableName,
+                const AuditLogQueryParam &param,
+                int &outTotalCount);
+            
+            // 全库条件查询（带分页，自动跨表查询）
+            static std::vector<std::map<std::string,std::string>> searchAuditTrailLogGlobal(
+                const AuditLogQueryParam &param,
+                int &outTotalCount);
+            
+            // 获取符合条件的总记录数（用于分页）
+            static int countAuditTrailLogWithFilter(
+                const std::string &tableName,
+                const AuditLogQueryParam &param);
+            
+            // 创建日志表索引（优化查询性能）
+            static void createAuditLogIndexes(const std::string &tableName);
 
 
             //-------------------------serial port------------------------------//
@@ -828,12 +857,24 @@ namespace HGMACHINE{
             //----------------------------scanner---------------------------//
             static void writeScannerInfo(const std::map<std::string,std::string> &info);
             static std::map<std::string,std::string> readScannerInfo();
-
+            
+            //----------------------------错误处理和超时控制---------------------------//
+            // 设置查询超时时间（毫秒）
+            static void setQueryTimeout(int timeoutMs);
+            // 获取最后一次错误信息
+            static std::string getLastError();
+            // 清除错误信息
+            static void clearLastError();
+            
         protected:
             // static SendInfo response;
             static HGSaveDataToDB dbOpera;
             static HGSaveDataToDB dataOpera;
             static HGSaveDataToDB logOpera;
+            
+            // 错误信息
+            static std::string m_lastError;
+            static int m_queryTimeoutMs;
     };
 }
 #ifdef __cplusplus
