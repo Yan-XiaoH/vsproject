@@ -653,6 +653,246 @@ std::string RWDb::getTaskRunRecordDataDB(){
         }
     }
 
+    // 静态成员初始化
+    std::string RWDb::m_lastError;
+    int RWDb::m_queryTimeoutMs = 30000; // 默认30秒超时
+
+    // 设置查询超时时间
+    void RWDb::setQueryTimeout(int timeoutMs) {
+        m_queryTimeoutMs = timeoutMs;
+    }
+
+    // 获取最后一次错误信息
+    std::string RWDb::getLastError() {
+        return m_lastError;
+    }
+
+    // 清除错误信息
+    void RWDb::clearLastError() {
+        m_lastError.clear();
+    }
+
+    // 构建WHERE子句
+    static std::string buildWhereClause(const RWDb::AuditLogQueryParam& param) {
+        std::string whereClause = "WHERE 1=1";
+        
+        if (!param.timeFrom.empty()) {
+            whereClause += " AND Time >= '" + param.timeFrom + "'";
+        }
+        if (!param.timeTo.empty()) {
+            whereClause += " AND Time <= '" + param.timeTo + "'";
+        }
+        if (!param.keyword.empty()) {
+            // 转义单引号防止SQL注入
+            std::string escapedKeyword = param.keyword;
+            size_t pos = 0;
+            while ((pos = escapedKeyword.find("'", pos)) != std::string::npos) {
+                escapedKeyword.replace(pos, 1, "''");
+                pos += 2;
+            }
+            whereClause += " AND (Time LIKE '%" + escapedKeyword + "%'";
+            whereClause += " OR Operator LIKE '%" + escapedKeyword + "%'";
+            whereClause += " OR LogContent LIKE '%" + escapedKeyword + "%')";
+        }
+        
+        return whereClause;
+    }
+
+    // 单表条件查询（带分页）
+    std::vector<std::map<std::string,std::string>> RWDb::readAuditTrailLogWithFilter(
+        const std::string &tableName,
+        const AuditLogQueryParam &param,
+        int &outTotalCount) {
+        
+        std::vector<std::map<std::string,std::string>> results;
+        outTotalCount = 0;
+        m_lastError.clear();
+        
+        if (tableName.empty()) {
+            m_lastError = "表名不能为空";
+            return results;
+        }
+        
+        try {
+            // 先获取总记录数
+            std::string countSql = "SELECT COUNT(*) as total FROM " + tableName + " " + buildWhereClause(param);
+            std::vector<std::map<std::string,std::string>> countResult;
+            if (logOpera.readData(countSql, countResult) && !countResult.empty()) {
+                try {
+                    outTotalCount = std::stoi(countResult[0]["total"]);
+                } catch (const std::exception& e) {
+                    m_lastError = std::string("解析记录数失败: ") + e.what();
+                    outTotalCount = 0;
+                }
+            }
+            
+            if (outTotalCount == 0) return results;
+            
+            // 执行分页查询
+            std::string sql = "SELECT Time, Operator, LogContent FROM " + tableName + " ";
+            sql += buildWhereClause(param);
+            sql += " ORDER BY Time DESC";  // 按时间倒序
+            sql += " LIMIT " + std::to_string(param.pageSize);
+            sql += " OFFSET " + std::to_string(param.pageIndex * param.pageSize);
+            
+            if (!logOpera.readData(sql, results)) {
+                m_lastError = "查询数据失败";
+            }
+        } catch (const std::exception& e) {
+            m_lastError = std::string("查询异常: ") + e.what();
+            outTotalCount = 0;
+            results.clear();
+        }
+        
+        return results;
+    }
+
+    // 获取符合条件的总记录数
+    int RWDb::countAuditTrailLogWithFilter(
+        const std::string &tableName,
+        const AuditLogQueryParam &param) {
+        
+        if (tableName.empty()) {
+            m_lastError = "表名不能为空";
+            return 0;
+        }
+        
+        try {
+            std::string countSql = "SELECT COUNT(*) as total FROM " + tableName + " " + buildWhereClause(param);
+            std::vector<std::map<std::string,std::string>> countResult;
+            if (logOpera.readData(countSql, countResult) && !countResult.empty()) {
+                try {
+                    return std::stoi(countResult[0]["total"]);
+                } catch (const std::exception& e) {
+                    m_lastError = std::string("解析记录数失败: ") + e.what();
+                    return 0;
+                }
+            }
+        } catch (const std::exception& e) {
+            m_lastError = std::string("计数查询异常: ") + e.what();
+        }
+        return 0;
+    }
+
+    // 全库条件查询（带分页）
+    std::vector<std::map<std::string,std::string>> RWDb::searchAuditTrailLogGlobal(
+        const AuditLogQueryParam &param,
+        int &outTotalCount) {
+        
+        std::vector<std::map<std::string,std::string>> allResults;
+        outTotalCount = 0;
+        m_lastError.clear();
+        
+        try {
+            // 获取所有日志表
+            std::vector<std::string> allTables = getAllAuditLogTables();
+            if (allTables.empty()) {
+                m_lastError = "没有找到日志表";
+                return allResults;
+            }
+            
+            // 按时间倒序排序表名（确保最新的表先查询）
+            std::sort(allTables.begin(), allTables.end(), std::greater<std::string>());
+            
+            // 计算每个表的符合条件的记录数
+            std::vector<std::pair<std::string, int>> tableCounts;
+            int totalCount = 0;
+            for (const auto& table : allTables) {
+                try {
+                    int count = countAuditTrailLogWithFilter(table, param);
+                    if (count > 0) {
+                        tableCounts.push_back({table, count});
+                        totalCount += count;
+                    }
+                } catch (const std::exception& e) {
+                    // 单个表查询失败，记录错误但继续处理其他表
+                    if (!m_lastError.empty()) m_lastError += "; ";
+                    m_lastError += std::string("表") + table + "查询失败: " + e.what();
+                }
+            }
+            outTotalCount = totalCount;
+            
+            if (totalCount == 0) return allResults;
+            
+            // 计算需要查询的数据范围
+            int startOffset = param.pageIndex * param.pageSize;
+            int endOffset = startOffset + param.pageSize;
+            int currentOffset = 0;
+            
+            // 跨表分页查询
+            for (const auto& [tableName, tableCount] : tableCounts) {
+                try {
+                    int tableStart = currentOffset;
+                    int tableEnd = currentOffset + tableCount;
+                    
+                    // 检查是否与目标范围有交集
+                    if (tableEnd <= startOffset || tableStart >= endOffset) {
+                        currentOffset += tableCount;
+                        continue;
+                    }
+                    
+                    // 计算该表内的查询范围
+                    int localStart = std::max(0, startOffset - tableStart);
+                    int localEnd = std::min(tableCount, endOffset - tableStart);
+                    int localLimit = localEnd - localStart;
+                    
+                    // 构建查询
+                    std::string sql = "SELECT Time, Operator, LogContent FROM " + tableName + " ";
+                    sql += buildWhereClause(param);
+                    sql += " ORDER BY Time DESC";
+                    sql += " LIMIT " + std::to_string(localLimit);
+                    sql += " OFFSET " + std::to_string(localStart);
+                    
+                    std::vector<std::map<std::string,std::string>> tableResults;
+                    if (!logOpera.readData(sql, tableResults)) {
+                        if (!m_lastError.empty()) m_lastError += "; ";
+                        m_lastError += std::string("表") + tableName + "数据读取失败";
+                        continue;
+                    }
+                    
+                    // 添加表名信息（用于调试）
+                    for (auto& row : tableResults) {
+                        row["_tableName"] = tableName;
+                    }
+                    
+                    allResults.insert(allResults.end(), tableResults.begin(), tableResults.end());
+                    currentOffset += tableCount;
+                    
+                    // 如果已经获取足够数据，提前退出
+                    if ((int)allResults.size() >= param.pageSize) {
+                        break;
+                    }
+                } catch (const std::exception& e) {
+                    if (!m_lastError.empty()) m_lastError += "; ";
+                    m_lastError += std::string("表") + tableName + "处理异常: " + e.what();
+                }
+            }
+        } catch (const std::exception& e) {
+            m_lastError = std::string("全局搜索异常: ") + e.what();
+            outTotalCount = 0;
+            allResults.clear();
+        }
+        
+        return allResults;
+    }
+
+    // 创建日志表索引
+    void RWDb::createAuditLogIndexes(const std::string &tableName) {
+        if (tableName.empty()) return;
+        
+        // 创建时间索引
+        std::string timeIndexSql = "CREATE INDEX IF NOT EXISTS idx_" + tableName + "_time ON " + tableName + "(Time)";
+        logOpera.writeData(timeIndexSql);
+        
+        // 创建操作员索引
+        std::string operatorIndexSql = "CREATE INDEX IF NOT EXISTS idx_" + tableName + "_operator ON " + tableName + "(Operator)";
+        logOpera.writeData(operatorIndexSql);
+        
+        // 创建复合索引（时间和操作员）
+        std::string compositeIndexSql = "CREATE INDEX IF NOT EXISTS idx_" + tableName + "_time_operator ON " + tableName + "(Time, Operator)";
+        logOpera.writeData(compositeIndexSql);
+    }
+
     void RWDb::writeAuditTrailLog(const std::string &logContent)
     {
         std::map<std::string,std::string> noLoginRecordInfo;
