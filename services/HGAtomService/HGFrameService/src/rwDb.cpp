@@ -653,6 +653,137 @@ std::string RWDb::getTaskRunRecordDataDB(){
         }
     }
 
+    std::vector<std::map<std::string,std::string>> RWDb::searchAllAuditTrailLogs(const std::string &keyword, const HGExactTime &timeFrom, const HGExactTime &timeTo, int page, int pageSize){
+        std::vector<std::map<std::string,std::string>> allResults;
+        std::vector<std::string> tableNames = getAllAuditLogTables();
+        
+        // Sort tables by name (which includes date) in descending order to search recent tables first
+        std::sort(tableNames.begin(), tableNames.end(), [](const std::string &a, const std::string &b){
+            return a > b;
+        });
+        
+        // Calculate offset and limit
+        int offset = (page - 1) * pageSize;
+        int remaining = pageSize;
+        int totalSkipped = 0;
+        
+        for (const std::string &tableName : tableNames){
+            // Build SQL query with time range and keyword filters
+            std::string sql = "SELECT * FROM " + tableName + " WHERE 1=1";
+            
+            // Add time range filter
+            std::string timeFromStr = std::to_string(timeFrom.tm_year) + "-" + 
+                                     (timeFrom.tm_mon < 10 ? "0" : "") + std::to_string(timeFrom.tm_mon) + "-" + 
+                                     (timeFrom.tm_mday < 10 ? "0" : "") + std::to_string(timeFrom.tm_mday) + " " +
+                                     (timeFrom.tm_hour < 10 ? "0" : "") + std::to_string(timeFrom.tm_hour) + ":" +
+                                     (timeFrom.tm_min < 10 ? "0" : "") + std::to_string(timeFrom.tm_min) + ":" +
+                                     (timeFrom.tm_sec < 10 ? "0" : "") + std::to_string(timeFrom.tm_sec);
+            
+            std::string timeToStr = std::to_string(timeTo.tm_year) + "-" + 
+                                   (timeTo.tm_mon < 10 ? "0" : "") + std::to_string(timeTo.tm_mon) + "-" + 
+                                   (timeTo.tm_mday < 10 ? "0" : "") + std::to_string(timeTo.tm_mday) + " " +
+                                   (timeTo.tm_hour < 10 ? "0" : "") + std::to_string(timeTo.tm_hour) + ":" +
+                                   (timeTo.tm_min < 10 ? "0" : "") + std::to_string(timeTo.tm_min) + ":" +
+                                   (timeTo.tm_sec < 10 ? "0" : "") + std::to_string(timeTo.tm_sec);
+            
+            sql += " AND Time >= '" + timeFromStr + "' AND Time <= '" + timeToStr + "'";
+            
+            // Add keyword filter using FTS if available
+            if (!keyword.empty()){
+                std::string ftsTableName = tableName + "_fts";
+                sql += " AND rowid IN (SELECT rowid FROM " + ftsTableName + " WHERE " + ftsTableName + " MATCH '" + keyword + "')";
+            }
+            
+            // Add order by
+            sql += " ORDER BY Time DESC";
+            
+            // Get count of results in this table
+            std::string countSql = "SELECT COUNT(*) as count FROM " + tableName + " WHERE 1=1";
+            countSql += " AND Time >= '" + timeFromStr + "' AND Time <= '" + timeToStr + "'";
+            if (!keyword.empty()){
+                std::string ftsTableName = tableName + "_fts";
+                countSql += " AND rowid IN (SELECT rowid FROM " + ftsTableName + " WHERE " + ftsTableName + " MATCH '" + keyword + "')";
+            }
+            
+            std::vector<std::map<std::string,std::string>> countResults;
+            logOpera.readData(countSql, countResults);
+            int tableCount = 0;
+            if (!countResults.empty()){
+                tableCount = std::stoi(countResults[0]["count"]);
+            }
+            
+            // Skip this table if we haven't reached the offset yet
+            if (totalSkipped + tableCount <= offset){
+                totalSkipped += tableCount;
+                continue;
+            }
+            
+            // Calculate how many records to skip in this table
+            int skipInTable = offset - totalSkipped;
+            totalSkipped += tableCount;
+            
+            // Add LIMIT and OFFSET to the query
+            sql += " LIMIT " + std::to_string(remaining) + " OFFSET " + std::to_string(skipInTable);
+            
+            // Execute query and get results
+            std::vector<std::map<std::string,std::string>> tableResults;
+            logOpera.readData(sql, tableResults);
+            
+            // Add results to allResults
+            for (const auto &record : tableResults){
+                if (remaining <= 0) break;
+                allResults.push_back(record);
+                remaining--;
+            }
+            
+            if (remaining <= 0) break;
+        }
+        
+        return allResults;
+    }
+
+    int RWDb::searchAllAuditTrailLogsCount(const std::string &keyword, const HGExactTime &timeFrom, const HGExactTime &timeTo){
+        int totalCount = 0;
+        std::vector<std::string> tableNames = getAllAuditLogTables();
+        
+        for (const std::string &tableName : tableNames){
+            // Build SQL query with time range and keyword filters
+            std::string sql = "SELECT COUNT(*) as count FROM " + tableName + " WHERE 1=1";
+            
+            // Add time range filter
+            std::string timeFromStr = std::to_string(timeFrom.tm_year) + "-" + 
+                                     (timeFrom.tm_mon < 10 ? "0" : "") + std::to_string(timeFrom.tm_mon) + "-" + 
+                                     (timeFrom.tm_mday < 10 ? "0" : "") + std::to_string(timeFrom.tm_mday) + " " +
+                                     (timeFrom.tm_hour < 10 ? "0" : "") + std::to_string(timeFrom.tm_hour) + ":" +
+                                     (timeFrom.tm_min < 10 ? "0" : "") + std::to_string(timeFrom.tm_min) + ":" +
+                                     (timeFrom.tm_sec < 10 ? "0" : "") + std::to_string(timeFrom.tm_sec);
+            
+            std::string timeToStr = std::to_string(timeTo.tm_year) + "-" + 
+                                   (timeTo.tm_mon < 10 ? "0" : "") + std::to_string(timeTo.tm_mon) + "-" + 
+                                   (timeTo.tm_mday < 10 ? "0" : "") + std::to_string(timeTo.tm_mday) + " " +
+                                   (timeTo.tm_hour < 10 ? "0" : "") + std::to_string(timeTo.tm_hour) + ":" +
+                                   (timeTo.tm_min < 10 ? "0" : "") + std::to_string(timeTo.tm_min) + ":" +
+                                   (timeTo.tm_sec < 10 ? "0" : "") + std::to_string(timeTo.tm_sec);
+            
+            sql += " AND Time >= '" + timeFromStr + "' AND Time <= '" + timeToStr + "'";
+            
+            // Add keyword filter using FTS if available
+            if (!keyword.empty()){
+                std::string ftsTableName = tableName + "_fts";
+                sql += " AND rowid IN (SELECT rowid FROM " + ftsTableName + " WHERE " + ftsTableName + " MATCH '" + keyword + "')";
+            }
+            
+            // Execute query and get count
+            std::vector<std::map<std::string,std::string>> results;
+            logOpera.readData(sql, results);
+            if (!results.empty()){
+                totalCount += std::stoi(results[0]["count"]);
+            }
+        }
+        
+        return totalCount;
+    }
+
     void RWDb::writeAuditTrailLog(const std::string &logContent)
     {
         std::map<std::string,std::string> noLoginRecordInfo;
@@ -669,11 +800,13 @@ std::string RWDb::getTaskRunRecordDataDB(){
         info["lastAuditTrailDB"]="";
         logOpera.readSingleInfo(AUDITTRAILDBRECORD,info);
         std::string dbName="";
+        bool isNewTable = false;
         if (info["lastAuditTrailDB"] == "")
         {
             HGExactTime curTime = HGExactTime::currentTime();
             dbName = "AuditTrailLog_" + curTime.toStringFromYearToDay();
             printf("blank: %s\n",dbName.c_str());
+            isNewTable = true;
         }
         else
         {
@@ -683,6 +816,7 @@ std::string RWDb::getTaskRunRecordDataDB(){
                 HGExactTime curTime = HGExactTime::currentTime();
                 dbName = "AuditTrailLog_" + curTime.toStringFromYearToDay();
                 printf(">=3000: %s\n",dbName.c_str());
+                isNewTable = true;
             }
             else
             {
@@ -691,6 +825,23 @@ std::string RWDb::getTaskRunRecordDataDB(){
             }
         }
         logOpera.writeRecord(dbName, "Time", infoS);
+        
+        // Add indexes to the table if it's a new table
+        if (isNewTable) {
+            // Add index on Time column for time range queries
+            logOpera.writeData("CREATE INDEX IF NOT EXISTS idx_" + dbName + "_time ON " + dbName + " (Time)");
+            // Add index on Operator column for operator searches
+            logOpera.writeData("CREATE INDEX IF NOT EXISTS idx_" + dbName + "_operator ON " + dbName + " (Operator)");
+            
+            // Create FTS virtual table for full-text search
+            std::string ftsTableName = dbName + "_fts";
+            logOpera.writeData("CREATE VIRTUAL TABLE IF NOT EXISTS " + ftsTableName + " USING FTS5(LogContent, Operator, Time)");
+            
+            // Create trigger to keep FTS table in sync
+            logOpera.writeData("CREATE TRIGGER IF NOT EXISTS " + dbName + "_ai AFTER INSERT ON " + dbName + " BEGIN INSERT INTO " + ftsTableName + "(LogContent, Operator, Time) VALUES (new.LogContent, new.Operator, new.Time); END");
+            logOpera.writeData("CREATE TRIGGER IF NOT EXISTS " + dbName + "_ad AFTER DELETE ON " + dbName + " BEGIN DELETE FROM " + ftsTableName + " WHERE rowid = old.rowid; END");
+            logOpera.writeData("CREATE TRIGGER IF NOT EXISTS " + dbName + "_au AFTER UPDATE ON " + dbName + " BEGIN UPDATE " + ftsTableName + " SET LogContent = new.LogContent, Operator = new.Operator, Time = new.Time WHERE rowid = old.rowid; END");
+        }
         info["lastAuditTrailDB"]=dbName;
         logOpera.recordSingleInfo(AUDITTRAILDBRECORD,info);
     }

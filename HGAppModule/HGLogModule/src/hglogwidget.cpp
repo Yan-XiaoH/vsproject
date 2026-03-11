@@ -8,7 +8,9 @@
 
 HGLogWidget::HGLogWidget(std::string lang,QWidget *parent) : QWidget(parent),
 m_lang(lang),
-m_curDisplayIndex(-1)
+m_curDisplayIndex(-1),
+m_curSearchPage(0),
+m_totalSearchPages(0)
 {
     RWDb::writeAuditTrailLog(loadTranslation(m_lang,"Enter")+loadTranslation(m_lang,"Log"));
     m_auditLogTableNames = RWDb::getAllAuditLogTables();
@@ -37,6 +39,15 @@ m_curDisplayIndex(-1)
     connect(m_saveLabel,SIGNAL(leftClicked()),this,SLOT(slotSaveSearchLog()));
     connect(m_nextLabel,SIGNAL(leftClicked()),this,SLOT(slotNext()));
     connect(m_preLabel,SIGNAL(leftClicked()),this,SLOT(slotPre()));
+    
+    // Add progress bar for asynchronous operations
+    m_progressBar = new QProgressBar();
+    m_progressBar->setRange(0, 0); // Indeterminate progress
+    m_progressBar->setVisible(false);
+    
+    // Set up future watcher
+    connect(&m_searchWatcher, SIGNAL(finished()), this, SLOT(onSearchFinished()));
+    connect(&m_searchWatcher, SIGNAL(canceled()), this, SLOT(onSearchCanceled()));
 
     m_tableW=new QTableWidget(0,3);
     QStringList headers={"时间",/*,"通道","采样电位","日志类型",*/"日志内容","操作员"};
@@ -60,6 +71,7 @@ m_curDisplayIndex(-1)
     m_manipulateLayout->addWidget(m_preLabel,0,3);
     m_manipulateLayout->addWidget(m_nextLabel,0,4);
     m_manipulateLayout->addWidget(m_pageLabel,0,5);
+    m_manipulateLayout->addWidget(m_progressBar,0,6);
     m_manipulateLayout->addWidget(m_tableW,1,0,1,10);
     m_manipulateGroup->setLayout(m_manipulateLayout);
 
@@ -68,6 +80,10 @@ m_curDisplayIndex(-1)
     m_layout->addWidget(m_logTypeComboBox,0,7,1,1);
     m_layout->addWidget(m_manipulateGroup,1,1,1,15);
     fnReadDB("");
+    
+    // Add slots for asynchronous processing
+    connect(this, SIGNAL(signalSearchStarted()), this, SLOT(onSearchStarted()));
+    connect(this, SIGNAL(signalSearchFinished()), this, SLOT(onSearchFinished()));
 }
 
 bool HGLogWidget::closeWindow()
@@ -84,26 +100,63 @@ HGLogWidget::~HGLogWidget()
     
 }
 void HGLogWidget::slotNext(){
-    if (m_curDisplayIndex < 0) return;
-    if (m_curDisplayIndex < int(m_auditLogTableNames.size())-1) m_curDisplayIndex++;
-    else {
-        QMessageBox::warning(this, QString::fromStdString(HG_DEVICE_NAME),
-                         "已经是最后一页");
-        m_curDisplayIndex=m_auditLogTableNames.size()-1;
-    }
-    std::string dbName=m_auditLogTableNames[m_curDisplayIndex];
-    fnReadDB(dbName);
-}
-void HGLogWidget::slotPre(){
-    if (m_curDisplayIndex < 0) {
-        QMessageBox::warning(this, QString::fromStdString(HG_DEVICE_NAME),
-                         "已经是第一页");
-        m_curDisplayIndex=0;
+    // Check if we're in search mode
+    if (!m_searchResults.empty()) {
+        if (m_curSearchPage < m_totalSearchPages - 1) {
+            m_curSearchPage++;
+            
+            // Start asynchronous search for next page
+            emit signalSearchStarted();
+            
+            m_searchFuture = QtConcurrent::run([] (const std::string &keyword, const HGExactTime &timeFrom, const HGExactTime &timeTo, int page, int pageSize) {
+                return RWDb::searchAllAuditTrailLogs(keyword, timeFrom, timeTo, page, pageSize);
+            }, m_searchCondition.key, m_searchCondition.timeFrom, m_searchCondition.timeTo, m_curSearchPage + 1, PAGE_SIZE);
+            
+            m_searchWatcher.setFuture(m_searchFuture);
+        } else {
+            QMessageBox::warning(this, QString::fromStdString(HG_DEVICE_NAME), "已经是最后一页");
+        }
     } else {
-        m_curDisplayIndex--;
+        // Original pagination for non-search mode
+        if (m_curDisplayIndex < 0) return;
+        if (m_curDisplayIndex < int(m_auditLogTableNames.size())-1) m_curDisplayIndex++;
+        else {
+            QMessageBox::warning(this, QString::fromStdString(HG_DEVICE_NAME), "已经是最后一页");
+            m_curDisplayIndex=m_auditLogTableNames.size()-1;
+        }
+        std::string dbName=m_auditLogTableNames[m_curDisplayIndex];
+        fnReadDB(dbName);
     }
-    std::string dbName=m_auditLogTableNames[m_curDisplayIndex];
-    fnReadDB(dbName);
+}
+
+void HGLogWidget::slotPre(){
+    // Check if we're in search mode
+    if (!m_searchResults.empty()) {
+        if (m_curSearchPage > 0) {
+            m_curSearchPage--;
+            
+            // Start asynchronous search for previous page
+            emit signalSearchStarted();
+            
+            m_searchFuture = QtConcurrent::run([] (const std::string &keyword, const HGExactTime &timeFrom, const HGExactTime &timeTo, int page, int pageSize) {
+                return RWDb::searchAllAuditTrailLogs(keyword, timeFrom, timeTo, page, pageSize);
+            }, m_searchCondition.key, m_searchCondition.timeFrom, m_searchCondition.timeTo, m_curSearchPage + 1, PAGE_SIZE);
+            
+            m_searchWatcher.setFuture(m_searchFuture);
+        } else {
+            QMessageBox::warning(this, QString::fromStdString(HG_DEVICE_NAME), "已经是第一页");
+        }
+    } else {
+        // Original pagination for non-search mode
+        if (m_curDisplayIndex < 0) {
+            QMessageBox::warning(this, QString::fromStdString(HG_DEVICE_NAME), "已经是第一页");
+            m_curDisplayIndex=0;
+        } else {
+            m_curDisplayIndex--;
+        }
+        std::string dbName=m_auditLogTableNames[m_curDisplayIndex];
+        fnReadDB(dbName);
+    }
 }
 int HGLogWidget::getTableNameIndex(const std::string &tableName){
     for (int i=0;i<int(m_auditLogTableNames.size());i++){
@@ -299,9 +352,86 @@ void HGLogWidget::slotTimeTo(QString text){
     m_searchCondition.timeTo.tm_min = 59;
     m_searchCondition.timeTo.tm_sec = 59;
 }
+// Helper function to highlight keyword in text
+QString highlightKeyword(const QString &text, const QString &keyword) {
+    if (keyword.isEmpty()) {
+        return text;
+    }
+    
+    QString highlightedText = text;
+    int index = 0;
+    while ((index = highlightedText.indexOf(keyword, index, Qt::CaseInsensitive)) != -1) {
+        highlightedText.insert(index, "<font color='red'>");
+        index += keyword.length() + 19; // 19 is the length of "<font color='red'>"
+        highlightedText.insert(index, "</font>");
+        index += 7; // 7 is the length of "</font>"
+    }
+    
+    return highlightedText;
+}
+
 void HGLogWidget::slotSearch(){
+    // Reset search page
+    m_curSearchPage = 0;
+    
+    // Get total count of search results asynchronously
+    QFuture<int> countFuture = QtConcurrent::run([] (const std::string &keyword, const HGExactTime &timeFrom, const HGExactTime &timeTo) {
+        return RWDb::searchAllAuditTrailLogsCount(keyword, timeFrom, timeTo);
+    }, m_searchCondition.key, m_searchCondition.timeFrom, m_searchCondition.timeTo);
+    
+    // Wait for count to complete (this is fast)
+    int totalCount = countFuture.result();
+    
+    // Calculate total pages
+    m_totalSearchPages = (totalCount + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    // Start asynchronous search for first page
+    emit signalSearchStarted();
+    
+    m_searchFuture = QtConcurrent::run([] (const std::string &keyword, const HGExactTime &timeFrom, const HGExactTime &timeTo, int page, int pageSize) {
+        return RWDb::searchAllAuditTrailLogs(keyword, timeFrom, timeTo, page, pageSize);
+    }, m_searchCondition.key, m_searchCondition.timeFrom, m_searchCondition.timeTo, m_curSearchPage + 1, PAGE_SIZE);
+    
+    m_searchWatcher.setFuture(m_searchFuture);
+}
+
+void HGLogWidget::onSearchStarted(){
+    m_progressBar->setVisible(true);
     m_tableW->setRowCount(0);
-    fnReadDB(m_auditLogTableNames[m_curDisplayIndex]);
+    m_tableW->setUpdatesEnabled(false);
+}
+
+void HGLogWidget::onSearchFinished(){
+    if (m_searchWatcher.isFinished()) {
+        m_searchResults = m_searchWatcher.result();
+        
+        // Display the results
+        m_tableW->setRowCount(m_searchResults.size());
+        int row = 0;
+        QString keyword = QString::fromStdString(m_searchCondition.key);
+        for (const auto &record : m_searchResults){
+            for (const auto &info : record){
+                int nameColIndex = m_logContentMap[info.first];
+                if (nameColIndex >= 0 && nameColIndex < m_tableW->columnCount()){
+                    QString text = QString::fromStdString(info.second);
+                    QString highlightedText = highlightKeyword(text, keyword);
+                    QTableWidgetItem *item = new QTableWidgetItem();
+                    item->setText(highlightedText);
+                    m_tableW->setItem(row, nameColIndex, item);
+                }
+            }
+            row++;
+        }
+        
+        m_pageLabel->setText("第" + QString::number(m_curSearchPage + 1) + "页/共" + QString::number(m_totalSearchPages) + "页");
+        m_tableW->setUpdatesEnabled(true);
+        m_progressBar->setVisible(false);
+    }
+}
+
+void HGLogWidget::onSearchCanceled(){
+    m_progressBar->setVisible(false);
+    QMessageBox::information(this, QString::fromStdString(HG_DEVICE_NAME), "搜索已取消");
 }
 void HGLogWidget::slotClearSearch(){ 
     m_searchCondition.Clear();
